@@ -2,7 +2,7 @@
 
 ## Overview
 
-This project presents an interactive Shiny dashboard for monitoring urban green infrastructure using a simulated city-scale LoRaWAN sensing network. The platform was developed as part of a dissertation project focused on real-time environmental monitoring, stormwater management, and flood-risk assessment in urban rain gardens and planters.
+This project presents an interactive Shiny dashboard for monitoring urban green infrastructure using a simulated city-scale LoRaWAN sensing network. The platform was developed as part of a dissertation project focused on real-time environmental monitoring, stormwater management, and flood-risk assessment in urban rain gardens.
 
 The dashboard integrates hydrological, meteorological, air quality, and water quality variables into a centralized monitoring platform with interactive visualization and spatial mapping capabilities.
 
