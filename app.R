@@ -5,76 +5,95 @@ library(plotly)
 library(DT)
 library(shinydashboard)
 library(leaflet)
+library(googlesheets4)
+library(janitor)
 
 # =====================================================
-# 1. LOAD DATA
+# 1. LOAD DATA FROM GOOGLE SHEETS
 # =====================================================
 rsconnect::writeManifest()
-df <- read_csv("lorawan_fake_dataset.csv", show_col_types = FALSE) %>%
-  mutate(timestamp = ymd_hms(timestamp))
+gs4_deauth()
 
-location_coords <- read_delim(
-  "location_coordinates.csv",
-  delim = ";",
-  show_col_types = FALSE
-)
+sheet_url <- "https://docs.google.com/spreadsheets/d/1fWM21UNofVthwWYZfPc-oE-Q8U5xDPMIr6IebxQ9WKg/edit?usp=sharing"
 
-if ("x" %in% names(location_coords)) {
-  location_coords <- location_coords %>% rename(latitude = x)
+sensors <- read_sheet(sheet_url, sheet = "sensors") %>%
+  clean_names() %>%
+  mutate(
+    dev_eui = as.character(dev_eui),
+    measurement_id = as.character(measurement_id),
+    measurement_name = as.character(measurement_name),
+    units = as.character(units)
+  )
+
+modules <- read_sheet(sheet_url, sheet = "modules") %>%
+  clean_names() %>%
+  mutate(
+    module = as.character(module),
+    module_name = as.character(module_name),
+    longitude = as.numeric(longitude),
+    latitude = as.numeric(latitude)
+  )
+
+read_measurement_sheet <- function(sheet_name) {
+  read_sheet(sheet_url, sheet = sheet_name) %>%
+    clean_names() %>%
+    mutate(measurement_name = sheet_name)
 }
 
-if ("y" %in% names(location_coords)) {
-  location_coords <- location_coords %>% rename(longitude = y)
-}
+df <- map_dfr(sensors$measurement_name, read_measurement_sheet) %>%
+  clean_names() %>%
+  mutate(
+    timestamp = ymd_hms(timestamp, quiet = TRUE),
+    dev_eui = as.character(dev_eui),
+    measurement_id = as.character(measurement_id),
+    measurement_value = as.numeric(measurement_value),
+    measurement_name = as.character(measurement_name)
+  ) %>%
+  left_join(
+    sensors,
+    by = c("dev_eui", "measurement_id", "measurement_name")
+  ) %>%
+  mutate(
+    module = str_extract(measurement_name, "^[A-Z]+[0-9]+"),
+    measurement_group = str_remove(measurement_name, "^[A-Z]+[0-9]+_")
+  ) %>%
+  left_join(modules, by = "module") %>%
+  filter(!is.na(timestamp))
 
-if (!"location" %in% names(df)) {
-  df <- df %>%
-    mutate(location = rep(location_coords$location, length.out = n()))
-}
-
-all_locations <- sort(unique(df$location))
+all_modules <- sort(unique(df$module_name))
+all_measurements <- sort(unique(df$measurement_group))
 
 # =====================================================
 # 2. UI
 # =====================================================
 
 ui <- dashboardPage(
-  dashboardHeader(title = "LoRaWAN Green Infrastructure Dashboard"),
+  dashboardHeader(title = "Rain Garden LoRaWAN Dashboard"),
   
   dashboardSidebar(
     sidebarMenu(
       menuItem("Overview", tabName = "overview", icon = icon("gauge-high")),
-      
-      menuItem(
-        "Monitoring", icon = icon("chart-line"),
-        menuSubItem("Soil Moisture", tabName = "soil"),
-        menuSubItem("Hydrology", tabName = "hydrology"),
-        menuSubItem("Weather", tabName = "weather"),
-        menuSubItem("Air Quality", tabName = "air"),
-        menuSubItem("Water Quality", tabName = "water_quality")
-      ),
-      
-      menuItem(
-        "Spatial", icon = icon("map"),
-        menuSubItem("Location Map", tabName = "location_map")
-      ),
-      
-      menuItem(
-        "Data", icon = icon("table"),
-        menuSubItem("Raw Data", tabName = "raw")
-      )
+      menuItem("Time Series", tabName = "timeseries", icon = icon("chart-line")),
+      menuItem("Location Map", tabName = "map", icon = icon("map")),
+      menuItem("Raw Data", tabName = "raw", icon = icon("table"))
     ),
     
     selectizeInput(
-      "selected_locations",
-      "Select location(s):",
-      choices = all_locations,
-      selected = all_locations,
+      "selected_modules",
+      "Select module(s):",
+      choices = all_modules,
+      selected = all_modules,
       multiple = TRUE,
-      options = list(
-        placeholder = "Choose one or more locations",
-        plugins = list("remove_button")
-      )
+      options = list(plugins = list("remove_button"))
+    ),
+    
+    selectizeInput(
+      "selected_measurements",
+      "Select measurement(s):",
+      choices = all_measurements,
+      selected = all_measurements,
+      multiple = TRUE,
+      options = list(plugins = list("remove_button"))
     ),
     
     dateRangeInput(
@@ -89,109 +108,39 @@ ui <- dashboardPage(
   
   dashboardBody(
     tabItems(
-      
       tabItem(
         tabName = "overview",
         fluidRow(
-          valueBoxOutput("mean_soil"),
-          valueBoxOutput("mean_rain"),
-          valueBoxOutput("mean_water")
+          valueBoxOutput("latest_ph"),
+          valueBoxOutput("latest_soil_moisture"),
+          valueBoxOutput("latest_soil_temp")
         ),
         fluidRow(
-          box(width = 12, title = "Precipitation", plotlyOutput("overview_precipitation_plot"))
-        ),
-        fluidRow(
-          box(width = 12, title = "Soil Moisture at 5 cm", plotlyOutput("overview_soil_plot"))
-        ),
-        fluidRow(
-          box(width = 12, title = "Surface Water Level", plotlyOutput("overview_water_plot"))
+          box(width = 12, title = "Latest Measurements", DTOutput("latest_table"))
         )
       ),
       
       tabItem(
-        tabName = "soil",
+        tabName = "timeseries",
         fluidRow(
-          box(width = 6, title = "Soil Moisture - 5 cm", plotlyOutput("soil_5cm_plot")),
-          box(width = 6, title = "Soil Moisture - 15 cm", plotlyOutput("soil_15cm_plot"))
-        ),
-        fluidRow(
-          box(width = 6, title = "Soil Moisture - 30 cm", plotlyOutput("soil_30cm_plot")),
-          box(width = 6, title = "Soil Moisture - 50 cm", plotlyOutput("soil_50cm_plot"))
+          uiOutput("measurement_plot_grid")
         )
       ),
       
       tabItem(
-        tabName = "hydrology",
+        tabName = "map",
         fluidRow(
-          box(width = 6, title = "Precipitation", plotlyOutput("precipitation_plot")),
-          box(width = 6, title = "Precipitation Intensity", plotlyOutput("precip_intensity_plot"))
-        ),
-        fluidRow(
-          box(width = 12, title = "Surface Water Level", plotlyOutput("surface_water_plot"))
-        )
-      ),
-      
-      tabItem(
-        tabName = "weather",
-        fluidRow(
-          box(width = 6, title = "Temperature", plotlyOutput("temperature_plot")),
-          box(width = 6, title = "Humidity", plotlyOutput("humidity_plot"))
-        ),
-        fluidRow(
-          box(width = 6, title = "Pressure", plotlyOutput("pressure_plot")),
-          box(width = 6, title = "Solar Radiation", plotlyOutput("solar_plot"))
-        ),
-        fluidRow(
-          box(width = 6, title = "Wind Speed", plotlyOutput("wind_speed_plot")),
-          box(width = 6, title = "Wind Direction", plotlyOutput("wind_direction_plot"))
-        )
-      ),
-      
-      tabItem(
-        tabName = "air",
-        fluidRow(
-          box(width = 6, title = "CO2", plotlyOutput("co2_plot")),
-          box(width = 6, title = "PM2.5", plotlyOutput("pm25_plot"))
-        ),
-        fluidRow(
-          box(width = 12, title = "PM10", plotlyOutput("pm10_plot"))
-        )
-      ),
-      
-      tabItem(
-        tabName = "water_quality",
-        fluidRow(
-          box(width = 6, title = "Water Temperature", plotlyOutput("water_temp_plot")),
-          box(width = 6, title = "Conductivity", plotlyOutput("conductivity_plot"))
-        )
-      ),
-      
-      tabItem(
-        tabName = "location_map",
-        fluidRow(
-          box(
-            width = 12,
-            title = "Selected Monitoring Locations",
-            leafletOutput("location_map", height = 600)
-          )
+          box(width = 12, title = "Monitoring Locations", leafletOutput("location_map", height = 600))
         )
       ),
       
       tabItem(
         tabName = "raw",
         fluidRow(
-          box(
-            width = 12,
-            title = "Download Data",
-            downloadButton("download_raw_data", "Export Data (CSV)")
-          )
+          box(width = 12, title = "Download Data", downloadButton("download_data", "Export Filtered Data"))
         ),
         fluidRow(
-          box(
-            width = 12,
-            title = "Raw Sensor Dataset",
-            DTOutput("data_table")
-          )
+          box(width = 12, title = "Raw Data", DTOutput("data_table"))
         )
       )
     )
@@ -205,12 +154,8 @@ ui <- dashboardPage(
 server <- function(input, output, session) {
   
   observeEvent(input$reset_filters, {
-    updateSelectizeInput(
-      session,
-      "selected_locations",
-      selected = all_locations
-    )
-    
+    updateSelectizeInput(session, "selected_modules", selected = all_modules)
+    updateSelectizeInput(session, "selected_measurements", selected = all_measurements)
     updateDateRangeInput(
       session,
       "date_range",
@@ -222,25 +167,21 @@ server <- function(input, output, session) {
   filtered_df <- reactive({
     req(input$date_range)
     
-    if (is.null(input$selected_locations) || length(input$selected_locations) == 0) {
-      return(df[0, ])
-    }
-    
     df %>%
       filter(
-        location %in% input$selected_locations,
+        module_name %in% input$selected_modules,
+        measurement_group %in% input$selected_measurements,
         as.Date(timestamp) >= input$date_range[1],
         as.Date(timestamp) <= input$date_range[2]
       )
   })
   
-  selected_location_coords <- reactive({
-    if (is.null(input$selected_locations) || length(input$selected_locations) == 0) {
-      return(location_coords[0, ])
-    }
-    
-    location_coords %>%
-      filter(location %in% input$selected_locations)
+  latest_values <- reactive({
+    filtered_df() %>%
+      group_by(measurement_group, measurement_name, module_name, units) %>%
+      slice_max(timestamp, n = 1, with_ties = FALSE) %>%
+      ungroup() %>%
+      select(timestamp, module_name, measurement_group, measurement_name, measurement_value, units)
   })
   
   empty_plot <- function(message = "No data available for selected filters") {
@@ -250,240 +191,201 @@ server <- function(input, output, session) {
           text = message,
           x = 0.5,
           y = 0.5,
-          showarrow = FALSE,
-          font = list(size = 16)
+          showarrow = FALSE
         )
       )
   }
   
-  make_line_plot <- function(data, y_var, y_label) {
-    if (nrow(data) == 0) return(empty_plot())
+  output$measurement_plot_grid <- renderUI({
+    plot_data <- filtered_df()
     
-    p <- data %>%
-      ggplot(aes(x = timestamp, y = .data[[y_var]], colour = location)) +
-      geom_line() +
-      labs(x = NULL, y = y_label, colour = "Location") +
-      theme_minimal()
-    
-    ggplotly(p)
-  }
-  
-  # =====================================================
-  # LOCATION MAP
-  # =====================================================
-  
-  output$location_map <- renderLeaflet({
-    sites <- selected_location_coords()
-    
-    if (nrow(sites) == 0) {
+    if (nrow(plot_data) == 0) {
       return(
-        leaflet() %>%
-          addProviderTiles(providers$CartoDB.Positron) %>%
-          setView(lng = -3.1883, lat = 55.9533, zoom = 6)
+        box(
+          width = 12,
+          title = "Sensor Time Series",
+          plotlyOutput("empty_timeseries_plot", height = 400)
+        )
       )
     }
     
-    map <- leaflet(sites) %>%
-      addProviderTiles(providers$CartoDB.Positron) %>%
-      addCircleMarkers(
-        lng = ~longitude,
-        lat = ~latitude,
-        label = ~location,
-        popup = ~paste0(
-          "<b>", location, "</b><br>",
-          "Latitude: ", round(latitude, 5), "<br>",
-          "Longitude: ", round(longitude, 5)
-        ),
-        radius = 8,
-        fillOpacity = 0.8,
-        stroke = TRUE
-      )
+    measurements <- plot_data %>%
+      distinct(measurement_group) %>%
+      arrange(measurement_group) %>%
+      pull(measurement_group)
     
-    if (nrow(sites) == 1) {
-      map %>%
-        setView(
-          lng = sites$longitude[1],
-          lat = sites$latitude[1],
-          zoom = 13
-        )
-    } else {
-      map %>%
-        fitBounds(
-          lng1 = min(sites$longitude, na.rm = TRUE),
-          lat1 = min(sites$latitude, na.rm = TRUE),
-          lng2 = max(sites$longitude, na.rm = TRUE),
-          lat2 = max(sites$latitude, na.rm = TRUE)
-        )
-    }
+    plot_boxes <- lapply(measurements, function(meas) {
+      plot_id <- paste0("plot_", make.names(meas))
+      
+      box(
+        width = 6,
+        title = meas,
+        plotlyOutput(plot_id, height = 350)
+      )
+    })
+    
+    do.call(tagList, plot_boxes)
   })
   
-  # =====================================================
-  # VALUE BOXES
-  # =====================================================
+  output$empty_timeseries_plot <- renderPlotly({
+    empty_plot()
+  })
   
-  output$mean_soil <- renderValueBox({
-    if (nrow(filtered_df()) == 0) {
-      return(valueBox("No data", "Mean Soil Moisture at 5 cm", icon = icon("seedling"), color = "yellow"))
+  observe({
+    plot_data_all <- filtered_df()
+    
+    measurements <- plot_data_all %>%
+      distinct(measurement_group) %>%
+      pull(measurement_group)
+    
+    lapply(measurements, function(meas) {
+      plot_id <- paste0("plot_", make.names(meas))
+      
+      output[[plot_id]] <- renderPlotly({
+        plot_data <- filtered_df() %>%
+          filter(measurement_group == meas)
+        
+        if (nrow(plot_data) == 0) {
+          return(empty_plot())
+        }
+        
+        unit_label <- plot_data %>%
+          filter(!is.na(units), units != "") %>%
+          distinct(units) %>%
+          pull(units) %>%
+          first()
+        
+        if (is.na(unit_label) || is.null(unit_label)) {
+          unit_label <- "Measurement value"
+        }
+        
+        p <- ggplot(
+          plot_data,
+          aes(
+            x = timestamp,
+            y = measurement_value,
+            colour = module_name,
+            text = paste0(
+              "Time: ", timestamp,
+              "<br>Module: ", module_name,
+              "<br>Measurement: ", measurement_name,
+              "<br>Value: ", measurement_value, " ", units
+            )
+          )
+        ) +
+          geom_line(linewidth = 0.8) +
+          geom_point(size = 1.2, alpha = 0.7) +
+          labs(
+            x = NULL,
+            y = unit_label,
+            colour = "Module"
+          ) +
+          theme_minimal()
+        
+        ggplotly(p, tooltip = "text") %>%
+          layout(
+            legend = list(
+              orientation = "h",
+              x = 0,
+              y = -0.2
+            ),
+            margin = list(l = 60, r = 20, t = 20, b = 80)
+          )
+      })
+    })
+  })
+  
+  output$latest_table <- renderDT({
+    datatable(
+      latest_values(),
+      options = list(pageLength = 10, scrollX = TRUE)
+    )
+  })
+  
+  output$latest_ph <- renderValueBox({
+    value <- latest_values() %>%
+      filter(str_detect(measurement_group, regex("pH", ignore_case = TRUE))) %>%
+      slice_max(timestamp, n = 1, with_ties = FALSE)
+    
+    if (nrow(value) == 0) {
+      return(valueBox("No data", "Latest pH", icon = icon("flask"), color = "yellow"))
     }
     
     valueBox(
-      value = paste0(round(mean(filtered_df()$soil_moisture_5cm, na.rm = TRUE), 1), "%"),
-      subtitle = "Mean Soil Moisture at 5 cm",
+      paste0(round(value$measurement_value[1], 2), " ", value$units[1]),
+      "Latest pH",
+      icon = icon("flask"),
+      color = "aqua"
+    )
+  })
+  
+  output$latest_soil_moisture <- renderValueBox({
+    value <- latest_values() %>%
+      filter(str_detect(measurement_group, regex("Soil Moisture", ignore_case = TRUE))) %>%
+      slice_max(timestamp, n = 1, with_ties = FALSE)
+    
+    if (nrow(value) == 0) {
+      return(valueBox("No data", "Latest Soil Moisture", icon = icon("seedling"), color = "yellow"))
+    }
+    
+    valueBox(
+      paste0(round(value$measurement_value[1], 1), " ", value$units[1]),
+      "Latest Soil Moisture",
       icon = icon("seedling"),
       color = "green"
     )
   })
   
-  output$mean_rain <- renderValueBox({
-    if (nrow(filtered_df()) == 0) {
-      return(valueBox("No data", "Mean Total Rainfall", icon = icon("cloud-rain"), color = "yellow"))
+  output$latest_soil_temp <- renderValueBox({
+    value <- latest_values() %>%
+      filter(str_detect(measurement_group, regex("Soil Temperature", ignore_case = TRUE))) %>%
+      slice_max(timestamp, n = 1, with_ties = FALSE)
+    
+    if (nrow(value) == 0) {
+      return(valueBox("No data", "Latest Soil Temperature", icon = icon("temperature-half"), color = "yellow"))
     }
     
-    total_rain <- filtered_df() %>%
-      group_by(location) %>%
-      summarise(total = sum(precipitation, na.rm = TRUE), .groups = "drop") %>%
-      summarise(mean_total = mean(total, na.rm = TRUE)) %>%
-      pull(mean_total)
-    
     valueBox(
-      value = paste0(round(total_rain, 1), " mm"),
-      subtitle = "Mean Total Rainfall per Selected Location",
-      icon = icon("cloud-rain"),
-      color = "blue"
+      paste0(round(value$measurement_value[1], 1), " ", value$units[1]),
+      "Latest Soil Temperature",
+      icon = icon("temperature-half"),
+      color = "red"
     )
   })
   
-  output$mean_water <- renderValueBox({
-    if (nrow(filtered_df()) == 0) {
-      return(valueBox("No data", "Mean Latest Surface Water Level", icon = icon("water"), color = "yellow"))
+  output$location_map <- renderLeaflet({
+    sites <- modules %>%
+      filter(module_name %in% input$selected_modules)
+    
+    if (nrow(sites) == 0) {
+      return(
+        leaflet() %>%
+          addProviderTiles(providers$CartoDB.Positron)
+      )
     }
     
-    latest_water <- filtered_df() %>%
-      group_by(location) %>%
-      slice_max(order_by = timestamp, n = 1, with_ties = FALSE) %>%
-      ungroup() %>%
-      summarise(mean_latest = mean(surface_water_level, na.rm = TRUE)) %>%
-      pull(mean_latest)
-    
-    valueBox(
-      value = paste0(round(latest_water, 1), " cm"),
-      subtitle = "Mean Latest Surface Water Level",
-      icon = icon("water"),
-      color = "aqua"
-    )
+    leaflet(sites) %>%
+      addProviderTiles(providers$CartoDB.Positron) %>%
+      addCircleMarkers(
+        lng = ~longitude,
+        lat = ~latitude,
+        label = ~module_name,
+        popup = ~paste0(
+          "<b>", module_name, "</b><br>",
+          "Module: ", module, "<br>",
+          "Latitude: ", latitude, "<br>",
+          "Longitude: ", longitude
+        ),
+        radius = 8,
+        fillOpacity = 0.8
+      ) %>%
+      fitBounds(
+        lng1 = min(sites$longitude, na.rm = TRUE),
+        lat1 = min(sites$latitude, na.rm = TRUE),
+        lng2 = max(sites$longitude, na.rm = TRUE),
+        lat2 = max(sites$latitude, na.rm = TRUE)
+      )
   })
-  
-  # =====================================================
-  # OVERVIEW
-  # =====================================================
-  
-  output$overview_precipitation_plot <- renderPlotly({
-    make_line_plot(filtered_df(), "precipitation", "Precipitation (mm / 5 min)")
-  })
-  
-  output$overview_soil_plot <- renderPlotly({
-    make_line_plot(filtered_df(), "soil_moisture_5cm", "Soil moisture (%)")
-  })
-  
-  output$overview_water_plot <- renderPlotly({
-    make_line_plot(filtered_df(), "surface_water_level", "Surface water level (cm)")
-  })
-  
-  # =====================================================
-  # SOIL MOISTURE
-  # =====================================================
-  
-  output$soil_5cm_plot <- renderPlotly({
-    make_line_plot(filtered_df(), "soil_moisture_5cm", "Soil moisture (%)")
-  })
-  
-  output$soil_15cm_plot <- renderPlotly({
-    make_line_plot(filtered_df(), "soil_moisture_15cm", "Soil moisture (%)")
-  })
-  
-  output$soil_30cm_plot <- renderPlotly({
-    make_line_plot(filtered_df(), "soil_moisture_30cm", "Soil moisture (%)")
-  })
-  
-  output$soil_50cm_plot <- renderPlotly({
-    make_line_plot(filtered_df(), "soil_moisture_50cm", "Soil moisture (%)")
-  })
-  
-  # =====================================================
-  # HYDROLOGY
-  # =====================================================
-  
-  output$precipitation_plot <- renderPlotly({
-    make_line_plot(filtered_df(), "precipitation", "Precipitation (mm / 5 min)")
-  })
-  
-  output$precip_intensity_plot <- renderPlotly({
-    make_line_plot(filtered_df(), "precip_intensity", "Precipitation intensity (mm/hr)")
-  })
-  
-  output$surface_water_plot <- renderPlotly({
-    make_line_plot(filtered_df(), "surface_water_level", "Surface water level (cm)")
-  })
-  
-  # =====================================================
-  # WEATHER
-  # =====================================================
-  
-  output$temperature_plot <- renderPlotly({
-    make_line_plot(filtered_df(), "temperature", "Temperature (°C)")
-  })
-  
-  output$humidity_plot <- renderPlotly({
-    make_line_plot(filtered_df(), "humidity", "Humidity (%)")
-  })
-  
-  output$pressure_plot <- renderPlotly({
-    make_line_plot(filtered_df(), "pressure", "Pressure (hPa)")
-  })
-  
-  output$solar_plot <- renderPlotly({
-    make_line_plot(filtered_df(), "solar_radiation", "Solar radiation (W/m²)")
-  })
-  
-  output$wind_speed_plot <- renderPlotly({
-    make_line_plot(filtered_df(), "wind_speed", "Wind speed (m/s)")
-  })
-  
-  output$wind_direction_plot <- renderPlotly({
-    make_line_plot(filtered_df(), "wind_direction", "Wind direction (degrees)")
-  })
-  
-  # =====================================================
-  # AIR QUALITY
-  # =====================================================
-  
-  output$co2_plot <- renderPlotly({
-    make_line_plot(filtered_df(), "co2", "CO2 (ppm)")
-  })
-  
-  output$pm25_plot <- renderPlotly({
-    make_line_plot(filtered_df(), "pm2_5", "PM2.5 (µg/m³)")
-  })
-  
-  output$pm10_plot <- renderPlotly({
-    make_line_plot(filtered_df(), "pm10", "PM10 (µg/m³)")
-  })
-  
-  # =====================================================
-  # WATER QUALITY
-  # =====================================================
-  
-  output$water_temp_plot <- renderPlotly({
-    make_line_plot(filtered_df(), "water_temp", "Water temperature (°C)")
-  })
-  
-  output$conductivity_plot <- renderPlotly({
-    make_line_plot(filtered_df(), "conductivity", "Conductivity (µS/cm)")
-  })
-  
-  # =====================================================
-  # RAW DATA
-  # =====================================================
   
   output$data_table <- renderDT({
     datatable(
@@ -492,9 +394,9 @@ server <- function(input, output, session) {
     )
   })
   
-  output$download_raw_data <- downloadHandler(
+  output$download_data <- downloadHandler(
     filename = function() {
-      paste0("lorawan_filtered_data_", Sys.Date(), ".csv")
+      paste0("rain_garden_sensor_data_", Sys.Date(), ".csv")
     },
     content = function(file) {
       write_csv(filtered_df(), file)
