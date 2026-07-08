@@ -11,10 +11,11 @@ library(janitor)
 # =====================================================
 # 1. LOAD DATA FROM GOOGLE SHEETS
 # =====================================================
-rsconnect::writeManifest()
+
 gs4_deauth()
 
 sheet_url <- "https://docs.google.com/spreadsheets/d/1fWM21UNofVthwWYZfPc-oE-Q8U5xDPMIr6IebxQ9WKg/edit?usp=sharing"
+rsconnect::writeManifest()
 
 sensors <- read_sheet(sheet_url, sheet = "sensors") %>%
   clean_names() %>%
