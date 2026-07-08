@@ -191,6 +191,8 @@ server <- function(input, output, session) {
   
   filtered_df <- reactive({
     req(input$date_range)
+    req(input$selected_modules)
+    req(input$selected_measurements)
     
     df_live() %>%
       filter(
