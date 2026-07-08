@@ -15,51 +15,62 @@ library(janitor)
 gs4_deauth()
 
 sheet_url <- "https://docs.google.com/spreadsheets/d/1fWM21UNofVthwWYZfPc-oE-Q8U5xDPMIr6IebxQ9WKg/edit?usp=sharing"
-rsconnect::writeManifest()
 
-sensors <- read_sheet(sheet_url, sheet = "sensors") %>%
-  clean_names() %>%
-  mutate(
-    dev_eui = as.character(dev_eui),
-    measurement_id = as.character(measurement_id),
-    measurement_name = as.character(measurement_name),
-    units = as.character(units)
-  )
-
-modules <- read_sheet(sheet_url, sheet = "modules") %>%
-  clean_names() %>%
-  mutate(
-    module = as.character(module),
-    module_name = as.character(module_name),
-    longitude = as.numeric(longitude),
-    latitude = as.numeric(latitude)
-  )
-
-read_measurement_sheet <- function(sheet_name) {
-  read_sheet(sheet_url, sheet = sheet_name) %>%
+load_google_sheet_data <- function() {
+  sensors <- read_sheet(sheet_url, sheet = "sensors") %>%
     clean_names() %>%
-    mutate(measurement_name = sheet_name)
+    mutate(
+      dev_eui = as.character(dev_eui),
+      measurement_id = as.character(measurement_id),
+      measurement_name = as.character(measurement_name),
+      units = as.character(units)
+    )
+  
+  modules <- read_sheet(sheet_url, sheet = "modules") %>%
+    clean_names() %>%
+    mutate(
+      module = as.character(module),
+      module_name = as.character(module_name),
+      longitude = as.numeric(longitude),
+      latitude = as.numeric(latitude)
+    )
+  
+  read_measurement_sheet <- function(sheet_name) {
+    read_sheet(sheet_url, sheet = sheet_name) %>%
+      clean_names() %>%
+      mutate(measurement_name = sheet_name)
+  }
+  
+  df <- map_dfr(sensors$measurement_name, read_measurement_sheet) %>%
+    clean_names() %>%
+    mutate(
+      timestamp = ymd_hms(timestamp, quiet = TRUE),
+      dev_eui = as.character(dev_eui),
+      measurement_id = as.character(measurement_id),
+      measurement_value = as.numeric(measurement_value),
+      measurement_name = as.character(measurement_name)
+    ) %>%
+    left_join(
+      sensors,
+      by = c("dev_eui", "measurement_id", "measurement_name")
+    ) %>%
+    mutate(
+      module = str_extract(measurement_name, "^[A-Z]+[0-9]+"),
+      measurement_group = str_remove(measurement_name, "^[A-Z]+[0-9]+_")
+    ) %>%
+    left_join(modules, by = "module") %>%
+    filter(!is.na(timestamp))
+  
+  list(
+    df = df,
+    sensors = sensors,
+    modules = modules
+  )
 }
 
-df <- map_dfr(sensors$measurement_name, read_measurement_sheet) %>%
-  clean_names() %>%
-  mutate(
-    timestamp = ymd_hms(timestamp, quiet = TRUE),
-    dev_eui = as.character(dev_eui),
-    measurement_id = as.character(measurement_id),
-    measurement_value = as.numeric(measurement_value),
-    measurement_name = as.character(measurement_name)
-  ) %>%
-  left_join(
-    sensors,
-    by = c("dev_eui", "measurement_id", "measurement_name")
-  ) %>%
-  mutate(
-    module = str_extract(measurement_name, "^[A-Z]+[0-9]+"),
-    measurement_group = str_remove(measurement_name, "^[A-Z]+[0-9]+_")
-  ) %>%
-  left_join(modules, by = "module") %>%
-  filter(!is.na(timestamp))
+initial_data <- load_google_sheet_data()
+df <- initial_data$df
+modules <- initial_data$modules
 
 all_modules <- sort(unique(df$module_name))
 all_measurements <- sort(unique(df$measurement_group))
@@ -154,6 +165,19 @@ ui <- dashboardPage(
 
 server <- function(input, output, session) {
   
+  live_data <- reactive({
+    invalidateLater(60000, session)  # refresh every 60 seconds
+    load_google_sheet_data()
+  })
+  
+  df_live <- reactive({
+    live_data()$df
+  })
+  
+  modules_live <- reactive({
+    live_data()$modules
+  })
+  
   observeEvent(input$reset_filters, {
     updateSelectizeInput(session, "selected_modules", selected = all_modules)
     updateSelectizeInput(session, "selected_measurements", selected = all_measurements)
@@ -168,7 +192,7 @@ server <- function(input, output, session) {
   filtered_df <- reactive({
     req(input$date_range)
     
-    df %>%
+    df_live() %>%
       filter(
         module_name %in% input$selected_modules,
         measurement_group %in% input$selected_measurements,
@@ -355,7 +379,7 @@ server <- function(input, output, session) {
   })
   
   output$location_map <- renderLeaflet({
-    sites <- modules %>%
+    sites <- modules_live() %>%
       filter(module_name %in% input$selected_modules)
     
     if (nrow(sites) == 0) {
