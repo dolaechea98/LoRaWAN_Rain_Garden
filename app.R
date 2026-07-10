@@ -166,7 +166,7 @@ ui <- dashboardPage(
 server <- function(input, output, session) {
   
   live_data <- reactive({
-    invalidateLater(60000, session)  # refresh every 60 seconds
+    invalidateLater(600000, session)  # refresh every 60 seconds
     load_google_sheet_data()
   })
   
