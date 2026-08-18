@@ -7,12 +7,16 @@ library(shinydashboard)
 library(leaflet)
 library(googlesheets4)
 library(janitor)
+library(jsonlite)
 
 # =====================================================
-# 1. CONFIGURATION
 # =====================================================
 
 gs4_deauth()
+
+# Keep all date/month labels in English regardless of the machine's
+# operating-system language (e.g. Jul, Aug instead of Jul., Ago.).
+Sys.setlocale("LC_TIME", "C")
 
 sheet_url <- paste0(
   "https://docs.google.com/spreadsheets/d/",
@@ -20,11 +24,16 @@ sheet_url <- paste0(
   "edit?usp=sharing"
 )
 
-# Refresh Google Sheets every 10 minutes.
 refresh_interval_ms <- 600000
 
-# Monitoring-page organization.
-# To move/add a variable later, edit only this list.
+open_meteo_model <- "ukmo_seamless"
+
+open_meteo_historical_url <-
+  "https://historical-forecast-api.open-meteo.com/v1/forecast"
+
+open_meteo_forecast_url <-
+  "https://api.open-meteo.com/v1/forecast"
+
 monitoring_groups <- list(
   soil = c(
     "Soil Moisture",
@@ -56,7 +65,6 @@ monitoring_titles <- c(
 
 monitoring_plot_order <- list(
   hydrology = c(
-    "Rainfall Hourly",
     "Outflow A",
     "Outflow A (Total)"
   )
@@ -64,25 +72,12 @@ monitoring_plot_order <- list(
 
 # TEMPORARY historical repair.
 # TRUE converts historical blank Wind Speed values created by the old
-# Apps Script (measurementValue || "") to 0 m/s.
 # After historical Wind Speed blanks are permanently filled with 0 in
-# Google Sheets, change this to FALSE so future missing values remain NA.
 repair_historical_wind_speed_blanks <- TRUE
 
-
 # =====================================================
-# 2. DATA HELPER FUNCTIONS
 # =====================================================
 
-# Supports:
-#   RG1_pH
-#   RG1_Soil Moisture
-#   RG1_Soil Moisture_15 cm
-#
-# Returns:
-#   module              = RG1
-#   measurement_group   = Soil Moisture
-#   measurement_layer   = 15 cm
 parse_measurement_names <- function(measurement_names) {
   name_parts <- str_split_fixed(
     measurement_names,
@@ -97,40 +92,54 @@ parse_measurement_names <- function(measurement_names) {
   )
 }
 
-
-read_metadata_sheet <- function(sheet_name) {
-  read_sheet(
-    ss = sheet_url,
-    sheet = sheet_name
-  ) %>%
-    clean_names()
+# Fast UTC date filtering without converting every timestamp to Date.
+in_date_range <- function(timestamp, start_date, end_date) {
+  start_time <- as.POSIXct(as.Date(start_date), tz = "UTC")
+  end_time <- as.POSIXct(as.Date(end_date) + 1, tz = "UTC")
+  timestamp >= start_time & timestamp < end_time
 }
 
+# Use googlesheets4's CSV export reader when available. It is usually
+# substantially faster for growing public sheets. Fall back to read_sheet()
+# for compatibility or if the fast path fails.
+read_sheet_fast <- function(sheet_name) {
+  tryCatch(
+    {
+      if ("range_speedread" %in% getNamespaceExports("googlesheets4")) {
+        googlesheets4::range_speedread(
+          ss = sheet_url,
+          sheet = sheet_name,
+          show_col_types = FALSE
+        )
+      } else {
+        read_sheet(ss = sheet_url, sheet = sheet_name)
+      }
+    },
+    error = function(e) {
+      warning(sprintf(
+        "Fast read failed for '%s'; retrying with read_sheet(): %s",
+        sheet_name, conditionMessage(e)
+      ))
+      read_sheet(ss = sheet_url, sheet = sheet_name)
+    }
+  ) %>% clean_names()
+}
+
+read_metadata_sheet <- read_sheet_fast
 
 read_measurement_sheet <- function(sheet_name) {
   tryCatch(
-    {
-      read_sheet(
-        ss = sheet_url,
-        sheet = sheet_name
-      ) %>%
-        clean_names() %>%
-        mutate(measurement_name = sheet_name)
-    },
-    error = function(error) {
-      warning(
-        sprintf(
-          "Could not read measurement sheet '%s': %s",
-          sheet_name,
-          conditionMessage(error)
-        )
-      )
-
+    read_sheet_fast(sheet_name) %>%
+      mutate(measurement_name = sheet_name),
+    error = function(e) {
+      warning(sprintf(
+        "Could not read measurement sheet '%s': %s",
+        sheet_name, conditionMessage(e)
+      ))
       tibble()
     }
   )
 }
-
 
 load_google_sheet_data <- function() {
 
@@ -247,9 +256,7 @@ load_google_sheet_data <- function() {
   )
 }
 
-
 # =====================================================
-# 3. PLOT HELPER FUNCTIONS
 # =====================================================
 
 make_timeseries_plot <- function(plot_data) {
@@ -339,9 +346,7 @@ make_timeseries_plot <- function(plot_data) {
     )
 }
 
-
 # =====================================================
-# 4. WIND ROSE HELPER FUNCTIONS
 # =====================================================
 
 prepare_wind_data <- function(data) {
@@ -401,9 +406,6 @@ prepare_wind_data <- function(data) {
       wind_speed = `Wind Speed`,
       wind_direction = `Wind Direction`
     ) %>%
-    # Wind speed is required for all observations.
-    # Wind direction may be NA for calm conditions and is only
-    # required later for non-calm directional observations.
     filter(!is.na(wind_speed)) %>%
     mutate(
       wind_direction = wind_direction %% 360,
@@ -463,7 +465,6 @@ prepare_wind_data <- function(data) {
       )
     )
 }
-
 
 make_wind_rose <- function(data) {
 
@@ -547,6 +548,16 @@ make_wind_rose <- function(data) {
     directional_data$speed_bin
   )
 
+  # Blue sequential palette:
+  wind_speed_colors <- c(
+    ">0–1 m/s" = "#D6EAF8",
+    "1–2 m/s"  = "#AED6F1",
+    "2–3 m/s"  = "#5DADE2",
+    "3–5 m/s"  = "#2E86C1",
+    "5–8 m/s"  = "#1B4F72",
+    ">8 m/s"   = "#0B2E4F"
+  )
+
   p <- plot_ly(
     type = "barpolar"
   )
@@ -565,6 +576,13 @@ make_wind_rose <- function(data) {
           speed_data$direction_bin
         ),
         name = speed_category,
+        marker = list(
+          color = wind_speed_colors[
+            as.character(
+              speed_category
+            )
+          ]
+        ),
         text = paste0(
           "Direction: ",
           speed_data$direction_bin,
@@ -608,7 +626,7 @@ make_wind_rose <- function(data) {
             "%"
           ),
           x = 0.5,
-          y = 1.08,
+          y = 1.16,
           xref = "paper",
           yref = "paper",
           showarrow = FALSE,
@@ -626,19 +644,248 @@ make_wind_rose <- function(data) {
       margin = list(
         l = 40,
         r = 40,
-        t = 65,
+        t = 95,
         b = 90
       )
     )
 }
 
-
-
 # =====================================================
-# 5. FAO-56 PENMAN-MONTEITH ET0 HELPERS
 # =====================================================
 
-# Saturation vapour pressure (kPa).
+build_open_meteo_radiation_url <- function(
+    base_url,
+    latitude,
+    longitude,
+    start_date,
+    end_date
+) {
+
+  params <- c(
+    latitude = format(
+      latitude,
+      scientific = FALSE,
+      trim = TRUE
+    ),
+    longitude = format(
+      longitude,
+      scientific = FALSE,
+      trim = TRUE
+    ),
+    hourly = "shortwave_radiation",
+    models = open_meteo_model,
+    timezone = "UTC",
+    start_date = as.character(start_date),
+    end_date = as.character(end_date)
+  )
+
+  query <- paste(
+    paste0(
+      names(params),
+      "=",
+      vapply(
+        params,
+        URLencode,
+        character(1),
+        reserved = TRUE
+      )
+    ),
+    collapse = "&"
+  )
+
+  paste0(
+    base_url,
+    "?",
+    query
+  )
+}
+
+fetch_open_meteo_radiation_block <- function(
+    base_url,
+    latitude,
+    longitude,
+    start_date,
+    end_date
+) {
+
+  api_url <- build_open_meteo_radiation_url(
+    base_url = base_url,
+    latitude = latitude,
+    longitude = longitude,
+    start_date = start_date,
+    end_date = end_date
+  )
+
+  response <- tryCatch(
+    {
+      jsonlite::fromJSON(
+        api_url,
+        simplifyVector = TRUE
+      )
+    },
+    error = function(error) {
+      warning(
+        paste(
+          "Open-Meteo radiation request failed:",
+          conditionMessage(error)
+        )
+      )
+      return(NULL)
+    }
+  )
+
+  if (is.null(response)) {
+    return(tibble())
+  }
+
+  if (
+    !is.null(response$error) &&
+    isTRUE(response$error)
+  ) {
+    warning(
+      paste(
+        "Open-Meteo API error:",
+        response$reason
+      )
+    )
+    return(tibble())
+  }
+
+  if (
+    is.null(response$hourly) ||
+    is.null(response$hourly$time) ||
+    is.null(response$hourly$shortwave_radiation)
+  ) {
+    warning(
+      "Open-Meteo returned no shortwave radiation data."
+    )
+    return(tibble())
+  }
+
+  tibble(
+    timestamp = ymd_hm(
+      response$hourly$time,
+      tz = "UTC",
+      quiet = TRUE
+    ),
+    shortwave_radiation_w_m2 =
+      as.numeric(
+        response$hourly$shortwave_radiation
+      )
+  ) %>%
+    filter(
+      !is.na(timestamp)
+    )
+}
+
+fetch_daily_shortwave_radiation <- function(
+    latitude,
+    longitude,
+    start_date,
+    end_date
+) {
+
+  start_date <- as.Date(start_date)
+  end_date <- as.Date(end_date)
+  today_utc <- as.Date(
+    Sys.time(),
+    tz = "UTC"
+  )
+
+  if (
+    is.na(start_date) ||
+    is.na(end_date) ||
+    start_date > end_date
+  ) {
+    return(tibble())
+  }
+
+  hourly_blocks <- list()
+
+  historical_end <- min(
+    end_date,
+    today_utc - 1
+  )
+
+  if (start_date <= historical_end) {
+    hourly_blocks[[length(hourly_blocks) + 1]] <-
+      fetch_open_meteo_radiation_block(
+        base_url = open_meteo_historical_url,
+        latitude = latitude,
+        longitude = longitude,
+        start_date = start_date,
+        end_date = historical_end
+      )
+  }
+
+  current_start <- max(
+    start_date,
+    today_utc
+  )
+
+  current_end <- min(
+    end_date,
+    today_utc
+  )
+
+  if (current_start <= current_end) {
+    hourly_blocks[[length(hourly_blocks) + 1]] <-
+      fetch_open_meteo_radiation_block(
+        base_url = open_meteo_forecast_url,
+        latitude = latitude,
+        longitude = longitude,
+        start_date = current_start,
+        end_date = current_end
+      )
+  }
+
+  if (length(hourly_blocks) == 0) {
+    return(tibble())
+  }
+
+  bind_rows(hourly_blocks) %>%
+    distinct(
+      timestamp,
+      .keep_all = TRUE
+    ) %>%
+    mutate(
+      date = as.Date(timestamp),
+
+      radiation_mj_m2_hour =
+        shortwave_radiation_w_m2 *
+          0.0036
+    ) %>%
+    group_by(date) %>%
+    summarise(
+      rs_mj_m2_day = if (
+        all(
+          is.na(
+            radiation_mj_m2_hour
+          )
+        )
+      ) {
+        NA_real_
+      } else {
+        sum(
+          radiation_mj_m2_hour,
+          na.rm = TRUE
+        )
+      },
+
+      radiation_hours = sum(
+        !is.na(
+          radiation_mj_m2_hour
+        )
+      ),
+
+      .groups = "drop"
+    ) %>%
+    arrange(date)
+}
+
+# =====================================================
+# =====================================================
+
 saturation_vapour_pressure <- function(temperature_c) {
   0.6108 * exp(
     (17.27 * temperature_c) /
@@ -646,10 +893,6 @@ saturation_vapour_pressure <- function(temperature_c) {
   )
 }
 
-
-# Convert barometric pressure to kPa using the magnitude of
-# the observed values. The current weather-station metadata
-# records pressure in Pa, but this also tolerates hPa or kPa.
 pressure_to_kpa <- function(pressure_value) {
 
   median_pressure <- median(
@@ -670,9 +913,6 @@ pressure_to_kpa <- function(pressure_value) {
   }
 }
 
-
-# Convert wind speed measured at height z to the FAO-56
-# standard height of 2 m (FAO-56 Eq. 47).
 wind_speed_to_2m <- function(wind_speed, measurement_height_m = 2) {
 
   if (
@@ -693,9 +933,6 @@ wind_speed_to_2m <- function(wind_speed, measurement_height_m = 2) {
     )
 }
 
-
-# Extraterrestrial radiation Ra (MJ m-2 day-1) from
-# latitude and day of year (FAO-56).
 extraterrestrial_radiation <- function(
     latitude_deg,
     day_of_year
@@ -743,9 +980,6 @@ extraterrestrial_radiation <- function(
     )
 }
 
-
-# Prepare one daily meteorological record per weather station.
-# Solar radiation is supplied separately by the dashboard slider.
 prepare_daily_et_weather <- function(
     data,
     station_module,
@@ -885,14 +1119,8 @@ prepare_daily_et_weather <- function(
     )
 }
 
-
-# Daily FAO-56 reference evapotranspiration (ET0).
-# solar_radiation_mj_m2_day is user-defined incoming solar
-# radiation Rs and is applied as a scenario value to every
-# day currently displayed.
 calculate_fao56_et0 <- function(
-    daily_weather,
-    solar_radiation_mj_m2_day
+    daily_weather
 ) {
 
   if (nrow(daily_weather) == 0) {
@@ -903,8 +1131,11 @@ calculate_fao56_et0 <- function(
   albedo <- 0.23
 
   daily_weather %>%
+    filter(
+      !is.na(rs_mj_m2_day)
+    ) %>%
     mutate(
-      rs = solar_radiation_mj_m2_day,
+      rs = rs_mj_m2_day,
 
       es_tmin = saturation_vapour_pressure(
         t_min
@@ -1038,14 +1269,12 @@ calculate_fao56_et0 <- function(
         ),
 
       # Negative daily ET0 values are not physically useful
-      # for this reference-ET display.
       et0_mm_day = pmax(
         et0_mm_day,
         0
       )
     )
 }
-
 
 make_et0_plot <- function(et_data) {
 
@@ -1104,8 +1333,8 @@ make_et0_plot <- function(et_data) {
         " mm/day",
         "<br>Kc: ",
         round(crop_coefficient, 2),
-        "<br>Solar radiation scenario: ",
-        round(rs, 1),
+        "<br>UKMO shortwave radiation (Rs): ",
+        round(rs, 2),
         " MJ/m²/day",
         "<br>Mean temperature: ",
         round(t_mean, 1),
@@ -1148,9 +1377,315 @@ make_et0_plot <- function(et_data) {
     )
 }
 
+# =====================================================
+# =====================================================
+
+# Long communication gaps are not interpreted as continuous rainfall.
+prepare_rainfall_depth <- function(
+    data,
+    max_gap_multiplier = 3
+) {
+
+  rainfall <- data %>%
+    filter(
+      measurement_group == "Rainfall Hourly"
+    ) %>%
+    arrange(
+      module,
+      timestamp
+    ) %>%
+    group_by(module) %>%
+    mutate(
+      interval_hours_raw =
+        as.numeric(
+          difftime(
+            lead(timestamp),
+            timestamp,
+            units = "hours"
+          )
+        )
+    ) %>%
+    ungroup()
+
+  if (nrow(rainfall) == 0) {
+    return(tibble())
+  }
+
+  cadence <- rainfall %>%
+    filter(
+      !is.na(interval_hours_raw),
+      interval_hours_raw > 0
+    ) %>%
+    group_by(module) %>%
+    summarise(
+      expected_interval_hours =
+        median(
+          interval_hours_raw,
+          na.rm = TRUE
+        ),
+      .groups = "drop"
+    )
+
+  rainfall %>%
+    left_join(
+      cadence,
+      by = "module"
+    ) %>%
+    mutate(
+      interval_hours = case_when(
+
+        # The final record has no future timestamp. Use the station's
+        is.na(interval_hours_raw) ~
+          expected_interval_hours,
+
+        # A large gap most likely represents missed transmissions.
+        interval_hours_raw >
+          expected_interval_hours *
+            max_gap_multiplier ~
+          NA_real_,
+
+        TRUE ~ interval_hours_raw
+      ),
+
+      rainfall_depth_mm = case_when(
+        is.na(measurement_value) ~ NA_real_,
+        is.na(interval_hours) ~ NA_real_,
+        TRUE ~
+          measurement_value *
+            interval_hours
+      )
+    )
+}
+
+aggregate_hourly_rainfall <- function(data) {
+
+  if (nrow(data) == 0) {
+    return(tibble())
+  }
+
+  data %>%
+    mutate(
+      hour =
+        floor_date(
+          timestamp,
+          unit = "hour"
+        )
+    ) %>%
+    group_by(
+      module,
+      module_name,
+      hour
+    ) %>%
+    summarise(
+      rainfall_mm = if (
+        all(
+          is.na(
+            rainfall_depth_mm
+          )
+        )
+      ) {
+        NA_real_
+      } else {
+        sum(
+          rainfall_depth_mm,
+          na.rm = TRUE
+        )
+      },
+
+      valid_intervals = sum(
+        !is.na(
+          rainfall_depth_mm
+        )
+      ),
+
+      .groups = "drop"
+    ) %>%
+    arrange(hour)
+}
+
+make_rainfall_soil_plot <- function(
+    soil_data,
+    rainfall_data,
+    rainfall_station_name,
+    soil_module_name
+) {
+
+  if (
+    nrow(soil_data) == 0 &&
+    nrow(rainfall_data) == 0
+  ) {
+    return(
+      plotly_empty() %>%
+        layout(
+          annotations = list(
+            text = "No rainfall or soil-moisture data available",
+            x = 0.5,
+            y = 0.5,
+            showarrow = FALSE
+          )
+        )
+    )
+  }
+
+  p <- plot_ly()
+
+  if (nrow(soil_data) > 0) {
+
+    soil_series <- soil_data %>%
+      distinct(series_name) %>%
+      pull(series_name)
+
+    for (series in soil_series) {
+
+      series_data <- soil_data %>%
+        filter(
+          series_name == series
+        )
+
+      p <- p %>%
+        add_lines(
+          data = series_data,
+          x = ~timestamp,
+          y = ~measurement_value,
+          name = series,
+          yaxis = "y",
+          text = ~paste0(
+            "Time: ",
+            format(
+              timestamp,
+              "%Y-%m-%d %H:%M:%S"
+            ),
+            "<br>Soil sensor: ",
+            series_name,
+            "<br>Soil moisture: ",
+            round(
+              measurement_value,
+              2
+            ),
+            " ",
+            units
+          ),
+          hoverinfo = "text"
+        )
+    }
+  }
+
+  if (nrow(rainfall_data) > 0) {
+
+    p <- p %>%
+      add_bars(
+        data = rainfall_data,
+        x = ~hour,
+        y = ~rainfall_mm,
+        name = paste0(
+          "Rainfall - ",
+          rainfall_station_name
+        ),
+        yaxis = "y2",
+        text = ~paste0(
+          "Hour: ",
+          format(
+            hour,
+            "%Y-%m-%d %H:%M"
+          ),
+          "<br>Rainfall depth: ",
+          round(
+            rainfall_mm,
+            2
+          ),
+          " mm",
+          "<br>Valid source intervals: ",
+          valid_intervals
+        ),
+        hoverinfo = "text",
+        opacity = 0.45
+      )
+  }
+
+  soil_range <- if (nrow(soil_data) > 0) {
+    range(
+      soil_data$measurement_value,
+      na.rm = TRUE
+    )
+  } else {
+    c(0, 100)
+  }
+
+  if (
+    !all(
+      is.finite(
+        soil_range
+      )
+    )
+  ) {
+    soil_range <- c(0, 100)
+  }
+
+  soil_padding <- max(
+    diff(soil_range) * 0.08,
+    1
+  )
+
+  p %>%
+    layout(
+      barmode = "overlay",
+
+      xaxis = list(
+        title = NULL
+      ),
+
+      yaxis = list(
+        title = "Soil Moisture",
+        range = c(
+          soil_range[1] -
+            soil_padding,
+          soil_range[2] +
+            soil_padding
+        )
+      ),
+
+      # autorange = "reversed" places zero at the top and increasing
+      yaxis2 = list(
+        title = "Rainfall depth (mm)",
+        overlaying = "y",
+        side = "right",
+        autorange = "reversed",
+        rangemode = "tozero"
+      ),
+
+      legend = list(
+        orientation = "h",
+        x = 0,
+        y = -0.18
+      ),
+
+      margin = list(
+        l = 70,
+        r = 80,
+        t = 20,
+        b = 90
+      ),
+
+      annotations = list(
+        list(
+          x = 0,
+          y = 1.08,
+          xref = "paper",
+          yref = "paper",
+          xanchor = "left",
+          showarrow = FALSE,
+          text = paste0(
+            "Rainfall station: ",
+            rainfall_station_name,
+            " | Soil moisture module: ",
+            soil_module_name
+          )
+        )
+      )
+    )
+}
 
 # =====================================================
-# 6. USER INTERFACE
 # =====================================================
 
 ui <- dashboardPage(
@@ -1277,11 +1812,43 @@ ui <- dashboardPage(
         fluidRow(
           box(
             width = 12,
+            title = "Rainfall–Soil Moisture Response",
+
+            fluidRow(
+              column(
+                width = 6,
+                selectInput(
+                  inputId = "rainfall_station",
+                  label = "Rainfall station:",
+                  choices = NULL
+                )
+              ),
+
+              column(
+                width = 6,
+                selectInput(
+                  inputId = "soil_moisture_module",
+                  label = "Soil moisture module:",
+                  choices = NULL
+                )
+              )
+            ),
+
+            plotlyOutput(
+              "rainfall_soil_plot",
+              height = 460
+            )
+          )
+        ),
+
+        fluidRow(
+          box(
+            width = 12,
             title = "FAO-56 Penman–Monteith Reference Evapotranspiration",
 
             fluidRow(
               column(
-                width = 4,
+                width = 6,
                 selectInput(
                   inputId = "et_station",
                   label = "Weather station:",
@@ -1290,7 +1857,7 @@ ui <- dashboardPage(
               ),
 
               column(
-                width = 4,
+                width = 6,
                 numericInput(
                   inputId = "et_wind_height",
                   label = "Wind measurement height (m):",
@@ -1298,18 +1865,6 @@ ui <- dashboardPage(
                   min = 0.5,
                   max = 10,
                   step = 0.1
-                )
-              ),
-
-              column(
-                width = 4,
-                sliderInput(
-                  inputId = "solar_radiation",
-                  label = "Assumed daily solar radiation (MJ/m²/day):",
-                  min = 0,
-                  max = 35,
-                  value = 10,
-                  step = 0.5
                 )
               )
             ),
@@ -1341,13 +1896,15 @@ ui <- dashboardPage(
 
             tags$p(
               style = "margin-top: 10px;",
-              tags$strong("Scenario model: "),
+              tags$strong("Radiation source: "),
               paste(
-                "ET₀ is calculated from observed temperature,",
-                "humidity, wind speed and barometric pressure,",
-                "with the selected solar-radiation value applied",
-                "to every displayed day. ETc then applies the",
-                "user-selected vegetation coefficient Kc."
+                "Daily incoming shortwave solar radiation (Rs)",
+                "is retrieved automatically from the Open-Meteo",
+                "UK Met Office Seamless model using the selected",
+                "weather station's latitude and longitude.",
+                "ET₀ uses the observed station temperature, humidity,",
+                "wind speed and barometric pressure. ETc then applies",
+                "the user-selected vegetation coefficient Kc."
               )
             )
           )
@@ -1392,7 +1949,6 @@ ui <- dashboardPage(
         )
       ),
 
-
       tabItem(
         tabName = "map",
 
@@ -1434,15 +1990,12 @@ ui <- dashboardPage(
   )
 )
 
-
 # =====================================================
-# 7. SERVER
 # =====================================================
 
 server <- function(input, output, session) {
 
   # ---------------------------------------------------
-  # Reactive data storage
   # ---------------------------------------------------
 
   data_store <- reactiveVal(NULL)
@@ -1451,9 +2004,7 @@ server <- function(input, output, session) {
   filters_initialized <- reactiveVal(FALSE)
   previous_max_date <- reactiveVal(NULL)
 
-
   # ---------------------------------------------------
-  # Data loading
   # ---------------------------------------------------
 
   load_data_into_store <- function() {
@@ -1490,7 +2041,6 @@ server <- function(input, output, session) {
     )
   }
 
-
   session$onFlushed(
     function() {
       load_data_into_store()
@@ -1498,12 +2048,10 @@ server <- function(input, output, session) {
     once = TRUE
   )
 
-
   refresh_timer <- reactiveTimer(
     intervalMs = refresh_interval_ms,
     session = session
   )
-
 
   observeEvent(
     refresh_timer(),
@@ -1513,29 +2061,20 @@ server <- function(input, output, session) {
     ignoreInit = TRUE
   )
 
-
   # ---------------------------------------------------
-  # Reactive accessors
   # ---------------------------------------------------
-
-  current_data <- reactive({
-    req(data_store())
-    data_store()
-  })
-
 
   df_live <- reactive({
-    current_data()$df
+    req(data_store())
+    data_store()$df
   })
-
 
   modules_live <- reactive({
-    current_data()$modules
+    req(data_store())
+    data_store()$modules
   })
 
-
   # ---------------------------------------------------
-  # Filter helpers
   # ---------------------------------------------------
 
   get_filter_options <- function(current_df) {
@@ -1576,9 +2115,7 @@ server <- function(input, output, session) {
     )
   }
 
-
   # ---------------------------------------------------
-  # Update filters after each successful load
   # ---------------------------------------------------
 
   observeEvent(
@@ -1692,9 +2229,7 @@ server <- function(input, output, session) {
     ignoreInit = TRUE
   )
 
-
   # ---------------------------------------------------
-  # Reset filters
   # ---------------------------------------------------
 
   observeEvent(
@@ -1733,9 +2268,7 @@ server <- function(input, output, session) {
     }
   )
 
-
   # ---------------------------------------------------
-  # Filtered data
   # ---------------------------------------------------
 
   filtered_df <- reactive({
@@ -1753,16 +2286,15 @@ server <- function(input, output, session) {
           input$selected_modules,
         measurement_group %in%
           input$selected_measurements,
-        as.Date(timestamp) >=
+        in_date_range(
+          timestamp,
           input$date_range[1],
-        as.Date(timestamp) <=
           input$date_range[2]
+        )
       )
   })
 
-
   # ---------------------------------------------------
-  # Latest values
   # ---------------------------------------------------
 
   latest_values <- reactive({
@@ -1797,14 +2329,219 @@ server <- function(input, output, session) {
       )
   })
 
-
   # ---------------------------------------------------
-  # FAO-56 Penman-Monteith ET0
   # ---------------------------------------------------
 
-  # Populate the ET weather-station selector using modules
-  # that contain the meteorological variables required by
-  # the model.
+  # These controls are intentionally independent of the general sidebar module
+  observeEvent(
+    data_store(),
+    {
+
+      current_df <- data_store()$df
+
+      rainfall_modules <- current_df %>%
+        filter(
+          measurement_group ==
+            "Rainfall Hourly"
+        ) %>%
+        distinct(
+          module,
+          module_name
+        ) %>%
+        arrange(module_name)
+
+      soil_modules <- current_df %>%
+        filter(
+          measurement_group ==
+            "Soil Moisture"
+        ) %>%
+        distinct(
+          module,
+          module_name
+        ) %>%
+        arrange(module_name)
+
+      if (nrow(rainfall_modules) > 0) {
+
+        rainfall_choices <- setNames(
+          rainfall_modules$module,
+          rainfall_modules$module_name
+        )
+
+        current_rainfall_station <- isolate(
+          input$rainfall_station
+        )
+
+        if (
+          is.null(
+            current_rainfall_station
+          ) ||
+          !current_rainfall_station %in%
+            rainfall_modules$module
+        ) {
+          current_rainfall_station <-
+            rainfall_modules$module[1]
+        }
+
+        updateSelectInput(
+          session = session,
+          inputId = "rainfall_station",
+          choices = rainfall_choices,
+          selected =
+            current_rainfall_station
+        )
+      }
+
+      if (nrow(soil_modules) > 0) {
+
+        soil_choices <- setNames(
+          soil_modules$module,
+          soil_modules$module_name
+        )
+
+        current_soil_module <- isolate(
+          input$soil_moisture_module
+        )
+
+        if (
+          is.null(
+            current_soil_module
+          ) ||
+          !current_soil_module %in%
+            soil_modules$module
+        ) {
+          current_soil_module <-
+            soil_modules$module[1]
+        }
+
+        updateSelectInput(
+          session = session,
+          inputId = "soil_moisture_module",
+          choices = soil_choices,
+          selected =
+            current_soil_module
+        )
+      }
+    },
+    ignoreInit = TRUE
+  )
+
+  rainfall_response_data <- reactive({
+
+    req(data_store())
+    req(input$rainfall_station)
+    req(input$date_range)
+
+    rainfall_source <- df_live() %>%
+      filter(
+        module ==
+          input$rainfall_station,
+        measurement_group ==
+          "Rainfall Hourly",
+
+        in_date_range(
+          timestamp,
+          input$date_range[1] - 1,
+          input$date_range[2]
+        )
+      )
+
+    interval_rainfall <-
+      prepare_rainfall_depth(
+        rainfall_source
+      )
+
+    hourly_rainfall <-
+      aggregate_hourly_rainfall(
+        interval_rainfall
+      )
+
+    hourly_rainfall %>%
+      filter(
+        in_date_range(
+          hour,
+          input$date_range[1],
+          input$date_range[2]
+        )
+      )
+  })
+
+  soil_response_data <- reactive({
+
+    req(data_store())
+    req(input$soil_moisture_module)
+    req(input$date_range)
+
+    df_live() %>%
+      filter(
+        module ==
+          input$soil_moisture_module,
+        measurement_group ==
+          "Soil Moisture",
+        in_date_range(
+          timestamp,
+          input$date_range[1],
+          input$date_range[2]
+        )
+      ) %>%
+      arrange(
+        series_name,
+        timestamp
+      )
+  })
+
+  output$rainfall_soil_plot <-
+    renderPlotly({
+
+      req(data_store())
+      req(input$rainfall_station)
+      req(input$soil_moisture_module)
+
+      rainfall_name <- modules_live() %>%
+        filter(
+          module ==
+            input$rainfall_station
+        ) %>%
+        pull(module_name)
+
+      soil_name <- modules_live() %>%
+        filter(
+          module ==
+            input$soil_moisture_module
+        ) %>%
+        pull(module_name)
+
+      rainfall_name <- if (
+        length(rainfall_name) > 0
+      ) {
+        rainfall_name[1]
+      } else {
+        input$rainfall_station
+      }
+
+      soil_name <- if (
+        length(soil_name) > 0
+      ) {
+        soil_name[1]
+      } else {
+        input$soil_moisture_module
+      }
+
+      make_rainfall_soil_plot(
+        soil_data =
+          soil_response_data(),
+        rainfall_data =
+          rainfall_response_data(),
+        rainfall_station_name =
+          rainfall_name,
+        soil_module_name =
+          soil_name
+      )
+    })
+
+  # ---------------------------------------------------
+  # ---------------------------------------------------
+
   observeEvent(
     data_store(),
     {
@@ -1864,8 +2601,6 @@ server <- function(input, output, session) {
         !current_selection %in%
           et_stations$module
       ) {
-        # WS1 is preferred when available because its
-        # wind sensor is installed at the FAO standard 2 m.
         selected_station <- if (
           "WS1" %in% et_stations$module
         ) {
@@ -1888,13 +2623,44 @@ server <- function(input, output, session) {
     ignoreInit = TRUE
   )
 
+  # ---------------------------------------------------
+  # ---------------------------------------------------
+  # Changing Kc or wind height does NOT trigger another API request.
+  solar_radiation_data <- reactive({
+
+    req(data_store())
+    req(input$et_station)
+    req(input$date_range)
+
+    module_row <- modules_live() %>%
+      filter(
+        module == input$et_station
+      ) %>%
+      slice_head(
+        n = 1
+      )
+
+    req(nrow(module_row) == 1)
+    req(!is.na(module_row$latitude))
+    req(!is.na(module_row$longitude))
+
+    fetch_daily_shortwave_radiation(
+      latitude =
+        module_row$latitude[1],
+      longitude =
+        module_row$longitude[1],
+      start_date =
+        input$date_range[1],
+      end_date =
+        input$date_range[2]
+    )
+  })
 
   et0_data <- reactive({
 
     req(data_store())
     req(input$et_station)
     req(input$date_range)
-    req(input$solar_radiation)
     req(input$crop_coefficient)
     req(input$et_wind_height)
 
@@ -1913,10 +2679,11 @@ server <- function(input, output, session) {
     station_weather <- df_live() %>%
       filter(
         module == input$et_station,
-        as.Date(timestamp) >=
+        in_date_range(
+          timestamp,
           input$date_range[1],
-        as.Date(timestamp) <=
           input$date_range[2]
+        )
       )
 
     daily_weather <-
@@ -1932,11 +2699,23 @@ server <- function(input, output, session) {
           input$et_wind_height
       )
 
+    radiation_data <-
+      solar_radiation_data()
+
+    if (nrow(radiation_data) == 0) {
+      return(tibble())
+    }
+
+    daily_weather <-
+      daily_weather %>%
+      left_join(
+        radiation_data,
+        by = "date"
+      )
+
     calculate_fao56_et0(
       daily_weather =
-        daily_weather,
-      solar_radiation_mj_m2_day =
-        input$solar_radiation
+        daily_weather
     ) %>%
       mutate(
         crop_coefficient =
@@ -1946,7 +2725,6 @@ server <- function(input, output, session) {
             et0_mm_day
       )
   })
-
 
   output$latest_et0 <-
     renderValueBox({
@@ -1990,7 +2768,6 @@ server <- function(input, output, session) {
         width = 6
       )
     })
-
 
   output$latest_etc <-
     renderValueBox({
@@ -2038,7 +2815,6 @@ server <- function(input, output, session) {
       )
     })
 
-
   output$et0_plot <-
     renderPlotly({
 
@@ -2047,9 +2823,7 @@ server <- function(input, output, session) {
       )
     })
 
-
   # ---------------------------------------------------
-  # Generic monitoring-page helpers
   # ---------------------------------------------------
 
   monitoring_data <- function(group_key) {
@@ -2061,6 +2835,26 @@ server <- function(input, output, session) {
       )
   }
 
+  standard_measurements <- function(group_key, plot_data) {
+    excluded <- c(
+      "Wind Speed",
+      "Wind Direction",
+      if (group_key == "hydrology") "Rainfall Hourly" else NA_character_
+    )
+
+    measurements <- plot_data %>%
+      filter(!measurement_group %in% excluded) %>%
+      distinct(measurement_group) %>%
+      pull(measurement_group)
+
+    preferred <- monitoring_plot_order[[group_key]]
+    if (is.null(preferred)) return(sort(measurements))
+
+    c(
+      intersect(preferred, measurements),
+      setdiff(measurements, preferred)
+    )
+  }
 
   create_monitoring_grid <- function(group_key) {
 
@@ -2099,24 +2893,29 @@ server <- function(input, output, session) {
         group_key
       )
 
-      # Wind variables are represented by wind roses,
-      # not conventional time-series charts.
       measurements <- plot_data %>%
         filter(
           !measurement_group %in%
             c(
               "Wind Speed",
-              "Wind Direction"
+              "Wind Direction",
+              if (
+                group_key == "hydrology"
+              ) {
+                "Rainfall Hourly"
+              } else {
+                NA_character_
+              }
             )
         ) %>%
         distinct(measurement_group) %>%
         pull(measurement_group)
-      
+
       if (group_key %in% names(monitoring_plot_order)) {
-        
+
         preferred_order <-
           monitoring_plot_order[[group_key]]
-        
+
         measurements <- c(
           intersect(
             preferred_order,
@@ -2127,9 +2926,9 @@ server <- function(input, output, session) {
             preferred_order
           )
         )
-        
+
       } else {
-        
+
         measurements <- sort(
           measurements
         )
@@ -2137,9 +2936,6 @@ server <- function(input, output, session) {
 
       if (length(measurements) == 0) {
 
-        # On the Weather page, wind-only data may still
-        # produce a wind rose below, so do not show an
-        # unnecessary empty-message box.
         if (
           group_key == "weather" &&
           nrow(plot_data) > 0
@@ -2191,7 +2987,6 @@ server <- function(input, output, session) {
     })
   }
 
-
   output$soil_plot_grid <-
     create_monitoring_grid("soil")
 
@@ -2201,8 +2996,6 @@ server <- function(input, output, session) {
   output$weather_plot_grid <-
     create_monitoring_grid("weather")
 
-
-  # Create all standard monitoring plots dynamically.
   observe({
 
     req(data_store())
@@ -2220,17 +3013,24 @@ server <- function(input, output, session) {
           !measurement_group %in%
             c(
               "Wind Speed",
-              "Wind Direction"
+              "Wind Direction",
+              if (
+                group_key == "hydrology"
+              ) {
+                "Rainfall Hourly"
+              } else {
+                NA_character_
+              }
             )
         ) %>%
         distinct(measurement_group) %>%
         pull(measurement_group)
-      
+
       if (group_key %in% names(monitoring_plot_order)) {
-        
+
         preferred_order <-
           monitoring_plot_order[[group_key]]
-        
+
         measurements <- c(
           intersect(
             preferred_order,
@@ -2241,9 +3041,9 @@ server <- function(input, output, session) {
             preferred_order
           )
         )
-        
+
       } else {
-        
+
         measurements <- sort(
           measurements
         )
@@ -2288,68 +3088,46 @@ server <- function(input, output, session) {
     }
   })
 
+  # ---------------------------------------------------
+  # ---------------------------------------------------
 
-  # ---------------------------------------------------
-  # Weather: wind roses
-  # ---------------------------------------------------
+  wind_source <- reactive({
+    monitoring_data("weather") %>%
+      filter(measurement_group %in% c("Wind Speed", "Wind Direction"))
+  })
+
+  wind_modules <- reactive({
+    wind_source() %>%
+      distinct(module, module_name, measurement_group) %>%
+      group_by(module, module_name) %>%
+      summarise(
+        has_speed = any(measurement_group == "Wind Speed"),
+        has_direction = any(measurement_group == "Wind Direction"),
+        .groups = "drop"
+      ) %>%
+      filter(has_speed, has_direction) %>%
+      arrange(module_name)
+  })
 
   output$wind_rose_grid <- renderUI({
 
     req(data_store())
 
-    wind_source <- monitoring_data(
-      "weather"
-    ) %>%
-      filter(
-        measurement_group %in%
-          c(
-            "Wind Speed",
-            "Wind Direction"
-          )
-      )
+    wind_data <- wind_source()
+    if (nrow(wind_data) == 0) return(NULL)
 
-    if (nrow(wind_source) == 0) {
-      return(NULL)
-    }
-
-    wind_modules <- wind_source %>%
-      distinct(
-        module,
-        module_name,
-        measurement_group
-      ) %>%
-      group_by(
-        module,
-        module_name
-      ) %>%
-      summarise(
-        has_speed = any(
-          measurement_group == "Wind Speed"
-        ),
-        has_direction = any(
-          measurement_group == "Wind Direction"
-        ),
-        .groups = "drop"
-      ) %>%
-      filter(
-        has_speed,
-        has_direction
-      ) %>%
-      arrange(module_name)
-
-    if (nrow(wind_modules) == 0) {
-      return(NULL)
-    }
+    wind_module_table <- wind_modules()
+    if (nrow(wind_module_table) == 0) return(NULL)
 
     wind_boxes <- lapply(
-      seq_len(nrow(wind_modules)),
+      seq_len(nrow(wind_module_table)),
       function(i) {
 
         current_module <-
-          wind_modules$module[i]
+          wind_module_table$module[i]
 
         current_name <-
-          wind_modules$module_name[i]
+          wind_module_table$module_name[i]
 
         plot_id <- paste0(
           "wind_rose_",
@@ -2376,58 +3154,21 @@ server <- function(input, output, session) {
     )
   })
 
-
   observe({
 
     req(data_store())
 
-    wind_source <- monitoring_data(
-      "weather"
-    ) %>%
-      filter(
-        measurement_group %in%
-          c(
-            "Wind Speed",
-            "Wind Direction"
-          )
-      )
-
-    wind_modules <- wind_source %>%
-      distinct(
-        module,
-        module_name,
-        measurement_group
-      ) %>%
-      group_by(
-        module,
-        module_name
-      ) %>%
-      summarise(
-        has_speed = any(
-          measurement_group == "Wind Speed"
-        ),
-        has_direction = any(
-          measurement_group == "Wind Direction"
-        ),
-        .groups = "drop"
-      ) %>%
-      filter(
-        has_speed,
-        has_direction
-      )
-
-    if (nrow(wind_modules) == 0) {
-      return()
-    }
+    wind_module_table <- wind_modules()
+    if (nrow(wind_module_table) == 0) return()
 
     lapply(
-      seq_len(nrow(wind_modules)),
+      seq_len(nrow(wind_module_table)),
       function(i) {
 
         local({
 
           current_module <-
-            wind_modules$module[i]
+            wind_module_table$module[i]
 
           plot_id <- paste0(
             "wind_rose_",
@@ -2437,17 +3178,8 @@ server <- function(input, output, session) {
           output[[plot_id]] <-
             renderPlotly({
 
-              module_data <- monitoring_data(
-                "weather"
-              ) %>%
-                filter(
-                  module == current_module,
-                  measurement_group %in%
-                    c(
-                      "Wind Speed",
-                      "Wind Direction"
-                    )
-                )
+              module_data <- wind_source() %>%
+                filter(module == current_module)
 
               paired_wind_data <-
                 prepare_wind_data(
@@ -2463,9 +3195,7 @@ server <- function(input, output, session) {
     )
   })
 
-
   # ---------------------------------------------------
-  # Overview table
   # ---------------------------------------------------
 
   output$latest_table <- renderDT({
@@ -2480,148 +3210,45 @@ server <- function(input, output, session) {
     )
   })
 
-
   # ---------------------------------------------------
-  # Overview value boxes
   # ---------------------------------------------------
 
-  output$latest_ph <- renderValueBox({
-
-    value <- latest_values() %>%
-      filter(
-        str_detect(
+  latest_box <- function(group, label, digits, icon_name, color) {
+    renderValueBox({
+      value <- latest_values() %>%
+        filter(str_detect(
           measurement_group,
-          regex(
-            "^pH$",
-            ignore_case = TRUE
-          )
-        )
-      ) %>%
-      slice_max(
-        timestamp,
-        n = 1,
-        with_ties = FALSE
-      )
+          regex(paste0("^", fixed(group), "$"), ignore_case = TRUE)
+        )) %>%
+        slice_max(timestamp, n = 1, with_ties = FALSE)
 
-    if (nrow(value) == 0) {
-      return(
-        valueBox(
-          "No data",
-          "Latest pH",
-          icon = icon("flask"),
+      if (nrow(value) == 0) {
+        return(valueBox(
+          "No data", label,
+          icon = icon(icon_name),
           color = "yellow"
-        )
+        ))
+      }
+
+      valueBox(
+        paste0(round(value$measurement_value[1], digits), " ", value$units[1]),
+        label,
+        icon = icon(icon_name),
+        color = color
       )
-    }
+    })
+  }
 
-    valueBox(
-      paste0(
-        round(
-          value$measurement_value[1],
-          2
-        ),
-        " ",
-        value$units[1]
-      ),
-      "Latest pH",
-      icon = icon("flask"),
-      color = "aqua"
-    )
-  })
-
-
-  output$latest_soil_moisture <- renderValueBox({
-
-    value <- latest_values() %>%
-      filter(
-        str_detect(
-          measurement_group,
-          regex(
-            "^Soil Moisture$",
-            ignore_case = TRUE
-          )
-        )
-      ) %>%
-      slice_max(
-        timestamp,
-        n = 1,
-        with_ties = FALSE
-      )
-
-    if (nrow(value) == 0) {
-      return(
-        valueBox(
-          "No data",
-          "Latest Soil Moisture",
-          icon = icon("seedling"),
-          color = "yellow"
-        )
-      )
-    }
-
-    valueBox(
-      paste0(
-        round(
-          value$measurement_value[1],
-          1
-        ),
-        " ",
-        value$units[1]
-      ),
-      "Latest Soil Moisture",
-      icon = icon("seedling"),
-      color = "green"
-    )
-  })
-
-
-  output$latest_soil_temp <- renderValueBox({
-
-    value <- latest_values() %>%
-      filter(
-        str_detect(
-          measurement_group,
-          regex(
-            "^Soil Temperature$",
-            ignore_case = TRUE
-          )
-        )
-      ) %>%
-      slice_max(
-        timestamp,
-        n = 1,
-        with_ties = FALSE
-      )
-
-    if (nrow(value) == 0) {
-      return(
-        valueBox(
-          "No data",
-          "Latest Soil Temperature",
-          icon = icon("temperature-half"),
-          color = "yellow"
-        )
-      )
-    }
-
-    valueBox(
-      paste0(
-        round(
-          value$measurement_value[1],
-          1
-        ),
-        " ",
-        value$units[1]
-      ),
-      "Latest Soil Temperature",
-      icon = icon("temperature-half"),
-      color = "red"
-    )
-  })
-
+  output$latest_ph <- latest_box("pH", "Latest pH", 2, "flask", "aqua")
+  output$latest_soil_moisture <- latest_box(
+    "Soil Moisture", "Latest Soil Moisture", 1, "seedling", "green"
+  )
+  output$latest_soil_temp <- latest_box(
+    "Soil Temperature", "Latest Soil Temperature", 1,
+    "temperature-half", "red"
+  )
 
   # ---------------------------------------------------
-  # Location map
   # ---------------------------------------------------
 
   output$location_map <- renderLeaflet({
@@ -2701,9 +3328,7 @@ server <- function(input, output, session) {
     }
   })
 
-
   # ---------------------------------------------------
-  # Raw data
   # ---------------------------------------------------
 
   output$data_table <- renderDT({
@@ -2717,7 +3342,6 @@ server <- function(input, output, session) {
       )
     )
   })
-
 
   output$download_data <- downloadHandler(
 
@@ -2738,9 +3362,7 @@ server <- function(input, output, session) {
   )
 }
 
-
 # =====================================================
-# 8. RUN APP
 # =====================================================
 
 shinyApp(
