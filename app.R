@@ -26,6 +26,11 @@ sheet_url <- paste0(
 
 refresh_interval_ms <- 600000
 
+# Study-site timezone used for environmental aggregation.
+# Raw LoRaWAN timestamps remain stored in UTC; local time is used only
+# when assigning observations to clock hours and calendar days.
+site_timezone <- "Europe/London"
+
 open_meteo_model <- "ukmo_seamless"
 
 open_meteo_historical_url <-
@@ -73,7 +78,7 @@ monitoring_plot_order <- list(
 # TEMPORARY historical repair.
 # TRUE converts historical blank Wind Speed values created by the old
 # After historical Wind Speed blanks are permanently filled with 0 in
-repair_historical_wind_speed_blanks <- TRUE
+repair_historical_wind_speed_blanks <- FALSE
 
 # =====================================================
 # =====================================================
@@ -97,6 +102,24 @@ in_date_range <- function(timestamp, start_date, end_date) {
   start_time <- as.POSIXct(as.Date(start_date), tz = "UTC")
   end_time <- as.POSIXct(as.Date(end_date) + 1, tz = "UTC")
   timestamp >= start_time & timestamp < end_time
+}
+
+# Local calendar-date filtering for environmental aggregations.
+# This keeps the underlying timestamp unchanged while assigning it to
+# the date observed at the Durham study site.
+in_local_date_range <- function(
+    timestamp,
+    start_date,
+    end_date,
+    timezone = site_timezone
+) {
+  local_date <- as.Date(
+    with_tz(timestamp, tzone = timezone),
+    tz = timezone
+  )
+
+  local_date >= as.Date(start_date) &
+    local_date <= as.Date(end_date)
 }
 
 # Use googlesheets4's CSV export reader when available. It is usually
@@ -200,9 +223,57 @@ load_google_sheet_data <- function() {
       dev_eui = str_trim(as.character(dev_eui)),
       measurement_id = str_trim(as.character(measurement_id)),
       measurement_value = as.numeric(measurement_value),
-      measurement_name = str_trim(as.character(measurement_name))
+      measurement_name = str_trim(as.character(measurement_name)),
+      raw_payload = as.character(raw_payload)
     ) %>%
-    filter(!is.na(timestamp)) %>%
+    filter(!is.na(timestamp))
+
+  # -------------------------------------------------
+  # DUPLICATE AUDIT
+  # -------------------------------------------------
+  # Treat rows as duplicate sensor observations only when the reception
+  # timestamp, device, measurement ID, measurement sheet/name and raw
+  # LoRaWAN payload are all identical.
+  duplicate_count <- measurements %>%
+    count(
+      timestamp,
+      dev_eui,
+      measurement_id,
+      measurement_name,
+      raw_payload
+    ) %>%
+    filter(n > 1) %>%
+    summarise(
+      duplicates = sum(n - 1)
+    ) %>%
+    pull(duplicates)
+
+  if (
+    length(duplicate_count) > 0 &&
+    duplicate_count > 0
+  ) {
+    warning(
+      paste(
+        duplicate_count,
+        "duplicated sensor observations removed."
+      )
+    )
+  }
+
+  # -------------------------------------------------
+  # REMOVE DUPLICATED SENSOR OBSERVATIONS
+  # -------------------------------------------------
+  # .keep_all = TRUE preserves the first full record while repeated
+  # copies are removed before any downstream environmental analysis.
+  measurements <- measurements %>%
+    distinct(
+      timestamp,
+      dev_eui,
+      measurement_id,
+      measurement_name,
+      raw_payload,
+      .keep_all = TRUE
+    ) %>%
     left_join(
       sensors,
       by = c(
@@ -674,7 +745,7 @@ build_open_meteo_radiation_url <- function(
     ),
     hourly = "shortwave_radiation",
     models = open_meteo_model,
-    timezone = "UTC",
+    timezone = site_timezone,
     start_date = as.character(start_date),
     end_date = as.character(end_date)
   )
@@ -765,7 +836,7 @@ fetch_open_meteo_radiation_block <- function(
   tibble(
     timestamp = ymd_hm(
       response$hourly$time,
-      tz = "UTC",
+      tz = site_timezone,
       quiet = TRUE
     ),
     shortwave_radiation_w_m2 =
@@ -787,9 +858,17 @@ fetch_daily_shortwave_radiation <- function(
 
   start_date <- as.Date(start_date)
   end_date <- as.Date(end_date)
-  today_utc <- as.Date(
+
+  # Daily FAO-56 ET0 is calculated only for completed local calendar days.
+  # Therefore radiation for the current Europe/London day is not used.
+  today_local <- as.Date(
     Sys.time(),
-    tz = "UTC"
+    tz = site_timezone
+  )
+
+  end_date <- min(
+    end_date,
+    today_local - 1
   )
 
   if (
@@ -804,7 +883,7 @@ fetch_daily_shortwave_radiation <- function(
 
   historical_end <- min(
     end_date,
-    today_utc - 1
+    today_local - 1
   )
 
   if (start_date <= historical_end) {
@@ -820,12 +899,12 @@ fetch_daily_shortwave_radiation <- function(
 
   current_start <- max(
     start_date,
-    today_utc
+    today_local
   )
 
   current_end <- min(
     end_date,
-    today_utc
+    today_local
   )
 
   if (current_start <= current_end) {
@@ -849,7 +928,12 @@ fetch_daily_shortwave_radiation <- function(
       .keep_all = TRUE
     ) %>%
     mutate(
-      date = as.Date(timestamp),
+      # timestamp is already parsed in Europe/London, so this is the
+      # local calendar date used by the station-based ET aggregation.
+      date = as.Date(
+        timestamp,
+        tz = site_timezone
+      ),
 
       radiation_mj_m2_hour =
         shortwave_radiation_w_m2 *
@@ -1004,7 +1088,23 @@ prepare_daily_et_weather <- function(
       measurement_value
     ) %>%
     mutate(
-      date = as.Date(timestamp)
+      timestamp_local = with_tz(
+        timestamp,
+        tzone = site_timezone
+      ),
+      date = as.Date(
+        timestamp_local,
+        tz = site_timezone
+      )
+    ) %>%
+    # FAO-56 daily ET0 is calculated only for completed local days.
+    # Exclude the current Europe/London calendar day.
+    filter(
+      date <
+        as.Date(
+          Sys.time(),
+          tz = site_timezone
+        )
     )
 
   if (nrow(station_data) == 0) {
@@ -1064,7 +1164,6 @@ prepare_daily_et_weather <- function(
   required_columns <- c(
     "minimum_Air Temperature",
     "maximum_Air Temperature",
-    "mean_Air Temperature",
     "minimum_Air Humidity",
     "maximum_Air Humidity",
     "mean_Wind Speed",
@@ -1087,7 +1186,13 @@ prepare_daily_et_weather <- function(
 
       t_min = .data[["minimum_Air Temperature"]],
       t_max = .data[["maximum_Air Temperature"]],
-      t_mean = .data[["mean_Air Temperature"]],
+
+      # FAO-56 daily mean temperature:
+      # Tmean = (Tmax + Tmin) / 2
+      t_mean = (
+        .data[["maximum_Air Temperature"]] +
+          .data[["minimum_Air Temperature"]]
+      ) / 2,
 
       rh_min = .data[["minimum_Air Humidity"]],
       rh_max = .data[["maximum_Air Humidity"]],
@@ -1099,9 +1204,16 @@ prepare_daily_et_weather <- function(
         .data[["mean_Barometric Pressure"]]
       ),
 
-      wind_speed_2m = wind_speed_to_2m(
-        wind_speed_observed,
-        wind_height_m
+      # Convert observed wind speed to the FAO-56 standard 2 m height,
+      # then apply the recommended minimum wind speed of 0.5 m/s for ET0.
+      # This affects only the evapotranspiration calculation; raw wind
+      # observations and wind roses remain unchanged.
+      wind_speed_2m = pmax(
+        wind_speed_to_2m(
+          wind_speed_observed,
+          wind_height_m
+        ),
+        0.5
       ),
 
       latitude = latitude,
@@ -1380,10 +1492,18 @@ make_et0_plot <- function(et_data) {
 # =====================================================
 # =====================================================
 
-# Long communication gaps are not interpreted as continuous rainfall.
+# Convert the S2120 "Rainfall Hourly" value (mm/h) into rainfall depth.
+#
+# The S2120 reports an hourly-equivalent rainfall intensity derived from the
+# rainfall accumulated during the PRECEDING 10 minutes. Therefore each reading
+# represents the interval [timestamp - 10 min, timestamp], not the time until
+# the next LoRaWAN transmission.
+#
+# Example:
+#   6 mm/h -> 1 mm accumulated during the preceding 10 minutes.
 prepare_rainfall_depth <- function(
     data,
-    max_gap_multiplier = 3
+    accumulation_minutes = 10
 ) {
 
   rainfall <- data %>%
@@ -1393,66 +1513,26 @@ prepare_rainfall_depth <- function(
     arrange(
       module,
       timestamp
-    ) %>%
-    group_by(module) %>%
-    mutate(
-      interval_hours_raw =
-        as.numeric(
-          difftime(
-            lead(timestamp),
-            timestamp,
-            units = "hours"
-          )
-        )
-    ) %>%
-    ungroup()
+    )
 
   if (nrow(rainfall) == 0) {
     return(tibble())
   }
 
-  cadence <- rainfall %>%
-    filter(
-      !is.na(interval_hours_raw),
-      interval_hours_raw > 0
-    ) %>%
-    group_by(module) %>%
-    summarise(
-      expected_interval_hours =
-        median(
-          interval_hours_raw,
-          na.rm = TRUE
-        ),
-      .groups = "drop"
-    )
+  accumulation_hours <- accumulation_minutes / 60
 
   rainfall %>%
-    left_join(
-      cadence,
-      by = "module"
-    ) %>%
     mutate(
-      interval_hours = case_when(
-
-        # The final record has no future timestamp. Use the station's
-        is.na(interval_hours_raw) ~
-          expected_interval_hours,
-
-        # A large gap most likely represents missed transmissions.
-        interval_hours_raw >
-          expected_interval_hours *
-            max_gap_multiplier ~
-          NA_real_,
-
-        TRUE ~ interval_hours_raw
-      ),
+      interval_start =
+        timestamp - minutes(accumulation_minutes),
+      interval_end = timestamp,
+      interval_minutes = accumulation_minutes,
 
       rainfall_depth_mm = case_when(
         is.na(measurement_value) ~ NA_real_,
-        is.na(interval_hours) ~ NA_real_,
         TRUE ~
           measurement_value *
-            interval_hours
+            accumulation_hours
       )
     )
 }
@@ -1463,14 +1543,82 @@ aggregate_hourly_rainfall <- function(data) {
     return(tibble())
   }
 
-  data %>%
-    mutate(
-      hour =
-        floor_date(
-          timestamp,
-          unit = "hour"
+  # Split each 10-minute accumulation window across any clock-hour boundary
+  # it overlaps. Rainfall is apportioned according to the fraction of the
+  # 10-minute interval falling inside each hour.
+  rainfall_parts <- pmap_dfr(
+    data,
+    function(
+      timestamp,
+      module,
+      module_name,
+      rainfall_depth_mm,
+      interval_start,
+      interval_end,
+      interval_minutes,
+      ...
+    ) {
+
+      interval_start_local <- with_tz(
+        interval_start,
+        tzone = site_timezone
+      )
+
+      interval_end_local <- with_tz(
+        interval_end,
+        tzone = site_timezone
+      )
+
+      first_hour <- floor_date(
+        interval_start_local,
+        unit = "hour"
+      )
+
+      last_hour <- floor_date(
+        interval_end_local - seconds(1e-6),
+        unit = "hour"
+      )
+
+      hour_sequence <- seq(
+        first_hour,
+        last_hour,
+        by = "hour"
+      )
+
+      tibble(
+        module = module,
+        module_name = module_name,
+        hour = hour_sequence
+      ) %>%
+        mutate(
+          overlap_start = pmax(
+            interval_start_local,
+            hour
+          ),
+          overlap_end = pmin(
+            interval_end_local,
+            hour + lubridate::hours(1)
+          ),
+          overlap_minutes = as.numeric(
+            difftime(
+              overlap_end,
+              overlap_start,
+              units = "mins"
+            )
+          ),
+          rainfall_part_mm = case_when(
+            is.na(rainfall_depth_mm) ~ NA_real_,
+            overlap_minutes <= 0 ~ NA_real_,
+            TRUE ~
+              rainfall_depth_mm *
+                overlap_minutes /
+                interval_minutes
+          )
         )
-    ) %>%
+    }
+  )
+
+  rainfall_parts %>%
     group_by(
       module,
       module_name,
@@ -1480,21 +1628,23 @@ aggregate_hourly_rainfall <- function(data) {
       rainfall_mm = if (
         all(
           is.na(
-            rainfall_depth_mm
+            rainfall_part_mm
           )
         )
       ) {
         NA_real_
       } else {
         sum(
-          rainfall_depth_mm,
+          rainfall_part_mm,
           na.rm = TRUE
         )
       },
 
+      # Count the number of source 10-minute rainfall windows that
+      # contributed valid rainfall information to this clock hour.
       valid_intervals = sum(
         !is.na(
-          rainfall_depth_mm
+          rainfall_part_mm
         )
       ),
 
@@ -2458,10 +2608,11 @@ server <- function(input, output, session) {
 
     hourly_rainfall %>%
       filter(
-        in_date_range(
+        in_local_date_range(
           hour,
           input$date_range[1],
-          input$date_range[2]
+          input$date_range[2],
+          timezone = site_timezone
         )
       )
   })
@@ -2644,6 +2795,21 @@ server <- function(input, output, session) {
     req(!is.na(module_row$latitude))
     req(!is.na(module_row$longitude))
 
+    completed_day_end <- min(
+      as.Date(input$date_range[2]),
+      as.Date(
+        Sys.time(),
+        tz = site_timezone
+      ) - 1
+    )
+
+    if (
+      as.Date(input$date_range[1]) >
+        completed_day_end
+    ) {
+      return(tibble())
+    }
+
     fetch_daily_shortwave_radiation(
       latitude =
         module_row$latitude[1],
@@ -2652,7 +2818,7 @@ server <- function(input, output, session) {
       start_date =
         input$date_range[1],
       end_date =
-        input$date_range[2]
+        completed_day_end
     )
   })
 
@@ -2681,8 +2847,16 @@ server <- function(input, output, session) {
         module == input$et_station,
         in_date_range(
           timestamp,
+          input$date_range[1] - 1,
+          input$date_range[2] + 1
+        )
+      ) %>%
+      filter(
+        in_local_date_range(
+          timestamp,
           input$date_range[1],
-          input$date_range[2]
+          input$date_range[2],
+          timezone = site_timezone
         )
       )
 
